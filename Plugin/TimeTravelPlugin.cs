@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Reflection;
 using BepInEx;
 using BepInEx.Configuration;
@@ -132,16 +133,41 @@ namespace TimeTravelMod
 			}
 			else
 			{
-				// Direct path: bypass the tiredness check, keep all vanilla sleep effects
-				// (mental health, sleep events, arrest check, day/night advance).
+				// Custom waiting function (2nd fix).
 				//
-				// Fixed-duration bug fix: StartSleep alone starts an *un-alarmed* sleep,
-				// which CheckEvent only ends when the player is no longer tired (natural
-				// wake-up). Emulate the vanilla Sleep(seconds) clock instead: set
-				// alarmEnabled + currentSleepSetTime so CheckEvent wakes the player
-				// exactly after the selected hours while keeping sleep events/arrest.
+				// Root cause of 013533a9 still sleeping until rested:
+				// StartSleep does NOT overwrite alarmEnabled / currentSleepSetTime
+				// (verified: neither field is assigned anywhere inside StartSleep,
+				// L261-330 of the decompiled WaitingController.cs). The Traverse-set
+				// alarm clock survives, but CheckEvent's alarm branch is never reached:
+				// PlayerStatsTiredness.UpdateStats is the ONLY caller of CheckEvent
+				// (PlayerStatsTiredness.cs L64/L79, driven by PlayerStats.DeltaSeconds
+				// subscribing to TimeOfDayAzure.SecondsPassed). In its sleeping branch it
+				// runs the "rested" check FIRST -
+				//   currentStatus -= RestRate/60f;
+				//   if (currentStatus <= 0f) { currentStatus = 0f; ... Wakeup(); }
+				// - and only THEN calls CheckEvent(sec), which returns immediately at
+				//   "if (waitingType == Type.None) return;" because Wakeup already reset
+				//   waitingType. With RequireTiredness=false the player is usually not
+				//   tired (currentStatus <= 10), so the natural wake-up fires within the
+				//   first UpdateStats tick - hence "sleeps until rested" again.
+				//
+				// Fix: keep the vanilla alarm fields (StartSleep preserves them) and run
+				// a frame-driven guard coroutine that clamps tiredness above 0. That stops
+				// the natural wake-up from stealing the sleep, so CheckEvent's vanilla
+				// countdown (currentSleepSetTime -= sec; <= 0 -> Wakeup(alarm:true)) runs
+				// to completion and wakes the player exactly after the selected hours.
+				// Sleep events / arrest checks / danger warnings are untouched (they are
+				// set up by StartSleep and executed by CheckEvent's timeToEventInSeconds).
 				t.Field("alarmEnabled").SetValue(true);
 				t.Field("currentSleepSetTime").SetValue(seconds);
+				PlayerStatsTiredness tiredness = PlayerStats.instance.tiredness;
+				if (tiredness.currentStatus <= 0f)
+				{
+					// Clamp synchronously BEFORE StartSleep so the very first
+					// UpdateStats tick cannot wake the player up.
+					tiredness.currentStatus = 1f;
+				}
 				MethodInfo startSleep = AccessTools.DeclaredMethod(typeof(WaitingController), "StartSleep", new Type[] { typeof(float), typeof(bool), typeof(SleepEvent[]), typeof(bool), typeof(float) });
 				if (startSleep == null)
 				{
@@ -149,8 +175,36 @@ namespace TimeTravelMod
 					return;
 				}
 				startSleep.Invoke(wc, new object[] { 0f, CanBeArrested.Value, null, false, 0.1f });
+				StartCoroutine(SleepGuard(wc, tiredness));
 			}
 			Logger.LogInfo("Time Travel: skipping " + currentHours + " hour(s).");
+		}
+
+		// Frame-driven guard for the custom waiting session:
+		// - Clamps tiredness above 0 so the vanilla "rested" natural wake-up never fires
+		//   before CheckEvent's alarm countdown reaches zero.
+		// - Fallback: if the alarm already expired but CheckEvent did not wake the
+		//   player (e.g. an event locked waitingType), call the vanilla Wakeup directly.
+		private IEnumerator SleepGuard(WaitingController wc, PlayerStatsTiredness tiredness)
+		{
+			while (true)
+			{
+				yield return null;
+				if (wc.waitingType == WaitingController.Type.None)
+				{
+					yield break;
+				}
+				if (tiredness.currentStatus <= 0f)
+				{
+					tiredness.currentStatus = 1f;
+				}
+				int remaining = Traverse.Create(wc).Field("currentSleepSetTime").GetValue<int>();
+				if (remaining <= 0)
+				{
+					wc.Wakeup(true);
+					yield break;
+				}
+			}
 		}
 	}
 }
