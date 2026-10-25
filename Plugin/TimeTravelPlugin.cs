@@ -134,6 +134,14 @@ namespace TimeTravelMod
 			{
 				// Direct path: bypass the tiredness check, keep all vanilla sleep effects
 				// (mental health, sleep events, arrest check, day/night advance).
+				//
+				// Fixed-duration bug fix: StartSleep alone starts an *un-alarmed* sleep,
+				// which CheckEvent only ends when the player is no longer tired (natural
+				// wake-up). Emulate the vanilla Sleep(seconds) clock instead: set
+				// alarmEnabled + currentSleepSetTime so CheckEvent wakes the player
+				// exactly after the selected hours while keeping sleep events/arrest.
+				t.Field("alarmEnabled").SetValue(true);
+				t.Field("currentSleepSetTime").SetValue(seconds);
 				MethodInfo startSleep = AccessTools.DeclaredMethod(typeof(WaitingController), "StartSleep", new Type[] { typeof(float), typeof(bool), typeof(SleepEvent[]), typeof(bool), typeof(float) });
 				if (startSleep == null)
 				{
