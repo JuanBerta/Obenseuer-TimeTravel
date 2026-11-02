@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Reflection;
 using BepInEx;
 using BepInEx.Configuration;
@@ -8,7 +8,7 @@ using UnityEngine;
 
 namespace TimeTravelMod
 {
-	[BepInPlugin("JuanBerta.Obenseuer.TimeTravel", "Time Travel", "1.1.0")]
+	[BepInPlugin("JuanBerta.Obenseuer.TimeTravel", "Time Travel", "1.2.0")]
 	public class TimeTravelPlugin : BaseUnityPlugin
 	{
 		internal static ConfigEntry<KeyboardShortcut> StartTravelKey;
@@ -33,14 +33,14 @@ namespace TimeTravelMod
 
 		private void Awake()
 		{
-			StartTravelKey = Config.Bind("General", "StartTravelKey", new KeyboardShortcut(KeyCode.F10), "Open the vanilla sleep-time selection UI (like the alarm clock) to choose how many hours to sleep.");
+			StartTravelKey = Config.Bind("General", "StartTravelKey", new KeyboardShortcut(KeyCode.F10), "Open the vanilla sleep-time selection UI (like the alarm clock) to choose the hour you want to wake up at.");
 			CanBeArrested = Config.Bind("General", "CanBeArrested", true, "Whether skipping time can trigger the vanilla arrest check like a normal sleep.");
 			RequireTiredness = Config.Bind("General", "RequireTiredness", false, "If true, time travel only works when the player is tired enough to sleep (vanilla restriction).");
 
 			Harmony harmony = new Harmony("JuanBerta.Obenseuer.TimeTravel");
 			harmony.PatchAll();
 			ModLogger = Logger;
-			Logger.LogInfo("Time Travel loaded (alarm-clock style sleep selection; tiredness bypass " + (RequireTiredness.Value ? "disabled" : "enabled") + ").");
+			Logger.LogInfo("Time Travel loaded (wake-up-hour sleep selection, ESC to cancel; tiredness bypass " + (RequireTiredness.Value ? "disabled" : "enabled") + ").");
 		}
 
 		private void Update()
@@ -48,6 +48,18 @@ namespace TimeTravelMod
 			if (StartTravelKey.Value.IsDown())
 			{
 				OpenSleepSelection();
+			}
+
+			// ESC closes the sleep-time selection UI before any sleep starts.
+			if (UiSleepArmed && Input.GetKeyDown(KeyCode.Escape))
+			{
+				WaitingUI ui = WaitingUI.instance;
+				if (ui != null && ui.waitingUIisVisible)
+				{
+					UiSleepArmed = false;
+					ui.CloseTimeSetUI();
+					Logger.LogInfo("Time Travel: sleep selection cancelled by ESC.");
+				}
 			}
 
 			// Session housekeeping for the custom waiting path.
@@ -65,8 +77,11 @@ namespace TimeTravelMod
 				// for sleeping, the alarm clock still wakes the player on time.
 				if (Input.GetKeyDown(KeyCode.Escape) && Time.unscaledTime - travelStartTime > 0.5f)
 				{
+					wc.alarmEnabled = false;
+					Traverse.Create(wc).Field("currentSleepSetTime").SetValue(0);
+					wc.Wakeup(false);
 					TravelActive = false;
-					Logger.LogInfo("Time Travel: manually cancelled by ESC, vanilla wake-up re-enabled.");
+					Logger.LogInfo("Time Travel: sleep cancelled by ESC.");
 					return;
 				}
 
@@ -121,6 +136,16 @@ namespace TimeTravelMod
 			// crimeArrest / hasAlarmClock, so the later StartSleep reuses them.
 			UiSleepArmed = !RequireTiredness.Value;
 			wc.ShowTimeSetUI(0f, CanBeArrested.Value, null, false, 0.1f, null, true);
+
+			WaitingUI ui = WaitingUI.instance;
+			if (UiSleepArmed && ui != null)
+			{
+				// Make sure the whole day is reachable on the vanilla slider so the
+				// player can pick any wake-up hour.
+				Traverse.Create(ui).Field("setAlarmSlider").GetValue<UnityEngine.UI.Slider>().maxValue = 86400f;
+				// Default: wake up 8 hours from now (fine-tune with the slider).
+				ui.ChangeSleepTimeAndSlider(8f * 3600f);
+			}
 			Logger.LogInfo("Time Travel: sleep-time selection opened.");
 		}
 	}
@@ -161,6 +186,54 @@ namespace TimeTravelMod
 				}
 			}
 			return true;
+		}
+	}
+
+	// Replaces the vanilla "Sleeping: X:XX" / duration counter with the actual
+	// wake-up clock time while the mod session is active, so the sleep-selection
+	// slider reads as "which hour will I wake up" instead of "how many hours
+	// will I sleep". During the sleep it keeps showing the fixed target time
+	// (remaining time ticks down while the game clock advances).
+	[HarmonyPatch(typeof(WaitingUI), "UpdateSleptTime")]
+	internal static class WakeUpTimeDisplayPatch
+	{
+		internal static bool Prefix(WaitingUI __instance, float sleepingTimeSeconds)
+		{
+			if (!TimeTravelPlugin.UiSleepArmed && !TimeTravelPlugin.TravelActive)
+			{
+				return true;
+			}
+			TimeOfDayAzure tod = TimeOfDayAzure.instance;
+			if (tod == null)
+			{
+				return true;
+			}
+			float nowSeconds = tod.currentTimeAndDay.hours * 3600f + tod.currentTimeAndDay.minutes * 60f;
+			float wakeSeconds = nowSeconds + sleepingTimeSeconds;
+			int daysAhead = (int)(wakeSeconds / 86400f);
+			float dayTime = wakeSeconds - (float)daysAhead * 86400f;
+			int hour = (int)(dayTime / 3600f);
+			int minute = (int)((dayTime - (float)hour * 3600f) / 60f);
+			string text;
+			if (daysAhead <= 0)
+			{
+				text = "Wake up at ";
+			}
+			else if (daysAhead == 1)
+			{
+				text = "Wake up tomorrow at ";
+			}
+			else
+			{
+				text = "Wake up in " + daysAhead + " days at ";
+			}
+			text += hour.ToString("00") + ":" + minute.ToString("00");
+			object label = Traverse.Create(__instance).Field("sleptTimeText").GetValue();
+			if (label != null)
+			{
+				Traverse.Create(label).Property("text").SetValue(text);
+			}
+			return false;
 		}
 	}
 
@@ -221,7 +294,7 @@ namespace TimeTravelMod
 
 			TimeTravelPlugin.TravelActive = true;
 			TimeTravelPlugin.travelStartTime = Time.unscaledTime;
-			TimeTravelPlugin.ModLogger.LogInfo("Time Travel: sleeping " + currentSleepSetTime + " second(s) (tiredness bypassed).");
+			TimeTravelPlugin.ModLogger.LogInfo("Time Travel: sleeping " + currentSleepSetTime + " second(s) (wake-up hour chosen, tiredness bypassed).");
 			return false;
 		}
 	}
