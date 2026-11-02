@@ -2,95 +2,52 @@ using System;
 using System.Reflection;
 using BepInEx;
 using BepInEx.Configuration;
+using BepInEx.Logging;
 using HarmonyLib;
 using UnityEngine;
 
 namespace TimeTravelMod
 {
-	[BepInPlugin("JuanBerta.Obenseuer.TimeTravel", "Time Travel", "1.0.0")]
+	[BepInPlugin("JuanBerta.Obenseuer.TimeTravel", "Time Travel", "1.1.0")]
 	public class TimeTravelPlugin : BaseUnityPlugin
 	{
-		internal static ConfigEntry<KeyboardShortcut> SelectHoursKey;
 		internal static ConfigEntry<KeyboardShortcut> StartTravelKey;
-		internal static ConfigEntry<string> TravelHours;
 		internal static ConfigEntry<bool> CanBeArrested;
 		internal static ConfigEntry<bool> RequireTiredness;
-
-		private int[] hoursOptions = new int[] { 1, 4, 8, 12, 24 };
-		private int selectedIndex;
-		private int currentHours = 1;
-		private float lastSelectTime = -10f;
 
 		// True only while the mod-driven custom waiting session is running
 		// (between the StartSleep invocation and the vanilla wake-up that clears
 		// waitingType). The Harmony patches use this to decide when to suppress
 		// the natural wake-up and to re-allow cancelling.
 		internal static bool TravelActive;
-		private float travelStartTime;
+		internal static float travelStartTime;
+
+		// Set when F10 opens the vanilla sleep-selection UI with the tiredness
+		// bypass enabled. Consumed by SleepBypassPatch on the first Sleep() call
+		// that happens while that UI is actually visible, so beds / alarm clocks
+		// used outside a mod-opened session keep the vanilla tiredness gate.
+		internal static bool UiSleepArmed;
+
+		// Static alias so nested patch classes can log (BaseUnityPlugin.Logger is protected).
+		internal static ManualLogSource ModLogger;
 
 		private void Awake()
 		{
-			SelectHoursKey = Config.Bind("General", "SelectHoursKey", new KeyboardShortcut(KeyCode.F9), "Cycle through the configurable skip durations.");
-			StartTravelKey = Config.Bind("General", "StartTravelKey", new KeyboardShortcut(KeyCode.F10), "Start skipping the currently selected amount of hours.");
-			TravelHours = Config.Bind("General", "TravelHours", "1,4,8,12,24", "Comma separated list of hours that can be skipped.");
+			StartTravelKey = Config.Bind("General", "StartTravelKey", new KeyboardShortcut(KeyCode.F10), "Open the vanilla sleep-time selection UI (like the alarm clock) to choose how many hours to sleep.");
 			CanBeArrested = Config.Bind("General", "CanBeArrested", true, "Whether skipping time can trigger the vanilla arrest check like a normal sleep.");
 			RequireTiredness = Config.Bind("General", "RequireTiredness", false, "If true, time travel only works when the player is tired enough to sleep (vanilla restriction).");
 
-			ParseHours();
-
 			Harmony harmony = new Harmony("JuanBerta.Obenseuer.TimeTravel");
 			harmony.PatchAll();
-			Logger.LogInfo("Time Travel loaded (Harmony natural wake-up interception active). Options: " + TravelHours.Value);
-		}
-
-		private void ParseHours()
-		{
-			try
-			{
-				string[] parts = TravelHours.Value.Split(new char[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries);
-				if (parts.Length == 0)
-				{
-					return;
-				}
-				int[] parsed = new int[parts.Length];
-				int count = 0;
-				foreach (string part in parts)
-				{
-					int v;
-					if (int.TryParse(part.Trim(), out v) && v > 0 && v <= 168)
-					{
-						parsed[count++] = v;
-					}
-				}
-				if (count == 0)
-				{
-					return;
-				}
-				hoursOptions = new int[count];
-				Array.Copy(parsed, hoursOptions, count);
-				if (selectedIndex >= count)
-				{
-					selectedIndex = 0;
-				}
-				currentHours = hoursOptions[selectedIndex];
-			}
-			catch (Exception ex)
-			{
-				Logger.LogError("Failed to parse TravelHours: " + ex.Message);
-			}
+			ModLogger = Logger;
+			Logger.LogInfo("Time Travel loaded (alarm-clock style sleep selection; tiredness bypass " + (RequireTiredness.Value ? "disabled" : "enabled") + ").");
 		}
 
 		private void Update()
 		{
-			if (SelectHoursKey.Value.IsDown())
-			{
-				selectedIndex = (selectedIndex + 1) % hoursOptions.Length;
-				currentHours = hoursOptions[selectedIndex];
-				lastSelectTime = Time.unscaledTime;
-			}
 			if (StartTravelKey.Value.IsDown())
 			{
-				StartTimeTravel();
+				OpenSleepSelection();
 			}
 
 			// Session housekeeping for the custom waiting path.
@@ -133,15 +90,7 @@ namespace TimeTravelMod
 			}
 		}
 
-		private void OnGUI()
-		{
-			if (Time.unscaledTime - lastSelectTime < 5f)
-			{
-				GUI.Label(new Rect(20f, 20f, 500f, 30f), "Time Travel: skip " + currentHours + " hour(s) - press " + StartTravelKey.Value.ToString() + " to start");
-			}
-		}
-
-		private void StartTimeTravel()
+		private void OpenSleepSelection()
 		{
 			WaitingController wc = WaitingController.instance;
 			if (wc == null)
@@ -159,92 +108,20 @@ namespace TimeTravelMod
 				Logger.LogWarning("Time Travel: waiting is blocked right now.");
 				return;
 			}
-
-			// Reuse the vanilla sleep parameters that ShowTimeSetUI would normally configure.
-			Traverse t = Traverse.Create(wc);
-			t.Field("quality").SetValue(0f);
-			t.Field("canBeArrested").SetValue(CanBeArrested.Value);
-			t.Field("sleepingEvents").SetValue(null);
-			t.Field("usePassoutEvents").SetValue(false);
-			t.Field("crimeArrest").SetValue(0.1f);
-			t.Field("hasAlarmClock").SetValue(false);
-			t.Field("onWakeup").SetValue(null);
-
-			int seconds = currentHours * 3600;
-			if (RequireTiredness.Value)
+			if (RequireTiredness.Value && !PlayerStats.instance.tiredness.CheckTiredness())
 			{
-				// Vanilla path: Sleep() still runs the tiredness check and sets up
-				// the alarm clock itself. The player is guaranteed tired enough
-				// (currentStatus > 10), so the vanilla alarm wins over the natural
-				// wake-up - no interception needed.
-				if (!wc.Sleep(seconds))
-				{
-					Logger.LogWarning("Time Travel: player is not tired enough to sleep.");
-				}
+				Logger.LogWarning("Time Travel: player is not tired enough to sleep.");
+				return;
 			}
-			else
-			{
-				// Custom waiting path (3rd fix, Harmony-based root cure).
-				//
-				// Why the coroutine guard (a6c35b6) failed:
-				// - The natural wake-up lives in PlayerStatsTiredness.UpdateStats
-				//   (L76-82): sleeping branch does currentStatus -= RestRate/60f and
-				//   if (currentStatus <= 0f) calls WaitingController.Wakeup(). That
-				//   tick is driven by PlayerStats.DeltaSeconds which subscribes to
-				//   TimeOfDayAzure.SecondsPassed (PlayerStats.cs L227/L306-323).
-				//   With SleepTimeSpeed = 150 one game hour = 0.4 real seconds, so
-				//   every real frame advances ~150 game seconds > 59 and UpdateStats
-				//   fires ONCE PER FRAME.
-				// - A frame-driven coroutine (yield return null resumes after the
-				//   next frame's Update) therefore always clamps AFTER the tick's
-				//   decision - it can never prevent the natural wake-up check in
-				//   the same frame, and any hitch / exception / StartCoroutine
-				//   timing issue silently kills the guard.
-				// - Worse: even a perfectly running clamp only blocks the
-				//   tiredness branch. The NEED-BASED wake-up in CheckEvent
-				//   (WaitingController.cs L183-185: reason != None &&
-				//   sleepingTimeSeconds > 3600 -> Wakeup()) calls Wakeup() directly
-				//   without consulting currentStatus - the guard never saw it, so a
-				//   hungry / thirsty / bleeding player woke up early with
-				//   currentStatus still ~0 (looks exactly like "slept until rested").
-				//
-				// Fix: intercept at the source with Harmony, no frame timing.
-				// - TirednessNaturalWakePatch clamps currentStatus > 0 in a Prefix
-				//   of UpdateStats, i.e. BEFORE the sleeping-branch decision runs
-				//   every tick - no coroutine, no frame race.
-				// - WakeupInterceptPatch blocks every vanilla Wakeup() call while the
-				//   mod alarm is still counting down (alarmEnabled && currentSleepSetTime
-				//   > 0), covering natural wake-up AND need-based / event wake-ups.
-				//   Once currentSleepSetTime <= 0 (alarm expired) it lets the vanilla
-				//   Wakeup(alarm:true) through and the session ends.
-				// - The mod's Update() re-enables vanilla behaviour on ESC (manual
-				//   cancel) or when waitingType becomes None, and retries Wakeup(true)
-				//   if the alarm expired but the player is still asleep.
-				// StartSleep still keeps the vanilla alarm fields, so CheckEvent's
-				// vanilla countdown (currentSleepSetTime -= sec; <= 0 -> Wakeup(true))
-				// wakes the player exactly after the selected hours. Sleep events /
-				// arrest checks / danger warnings are untouched (they are set up by
-				// StartSleep and executed by CheckEvent's timeToEventInSeconds).
-				t.Field("alarmEnabled").SetValue(true);
-				t.Field("currentSleepSetTime").SetValue(seconds);
-				PlayerStatsTiredness tiredness = PlayerStats.instance.tiredness;
-				if (tiredness.currentStatus <= 0f)
-				{
-					// Synchronous clamp before StartSleep so the very first tick
-					// cannot wake the player up.
-					tiredness.currentStatus = 1f;
-				}
-				MethodInfo startSleep = AccessTools.DeclaredMethod(typeof(WaitingController), "StartSleep", new Type[] { typeof(float), typeof(bool), typeof(SleepEvent[]), typeof(bool), typeof(float) });
-				if (startSleep == null)
-				{
-					Logger.LogError("Time Travel: could not find WaitingController.StartSleep.");
-					return;
-				}
-				startSleep.Invoke(wc, new object[] { 0f, CanBeArrested.Value, null, false, 0.1f });
-				TravelActive = true;
-				travelStartTime = Time.unscaledTime;
-			}
-			Logger.LogInfo("Time Travel: skipping " + currentHours + " hour(s).");
+
+			// Mirror Sleep.Use() with hasAlarmClock=true: WaitingUI.SetTimeOpen
+			// then shows the hour slider (setAlarm) and lets the player choose
+			// how long to sleep, exactly like an alarm clock. ShowTimeSetUI
+			// writes quality / canBeArrested / sleepingEvents / usePassoutEvents /
+			// crimeArrest / hasAlarmClock, so the later StartSleep reuses them.
+			UiSleepArmed = !RequireTiredness.Value;
+			wc.ShowTimeSetUI(0f, CanBeArrested.Value, null, false, 0.1f, null, true);
+			Logger.LogInfo("Time Travel: sleep-time selection opened.");
 		}
 	}
 
@@ -284,6 +161,68 @@ namespace TimeTravelMod
 				}
 			}
 			return true;
+		}
+	}
+
+	// Lets the mod-opened sleep selection UI start a sleep even when the player
+	// is not tired (RequireTiredness=false). The vanilla Sleep() refuses to
+	// start unless CheckTiredness() passes; we mirror its setup but call the
+	// private StartSleep directly. Only fires when UiSleepArmed is set AND the
+	// vanilla sleep UI is actually on screen, so beds / alarm clocks used by
+	// the player outside a mod session keep the vanilla tiredness gate.
+	[HarmonyPatch(typeof(WaitingController), "Sleep", new Type[] { typeof(int) })]
+	internal static class SleepBypassPatch
+	{
+		internal static bool Prefix(WaitingController __instance, int currentSleepSetTime)
+		{
+			if (!TimeTravelPlugin.UiSleepArmed || TimeTravelPlugin.RequireTiredness.Value)
+			{
+				return true;
+			}
+			WaitingUI ui = WaitingUI.instance;
+			if (ui == null || !ui.waitingUIisVisible)
+			{
+				return true;
+			}
+			TimeTravelPlugin.UiSleepArmed = false;
+			if (WaitingController.WaitingBlocked)
+			{
+				return false;
+			}
+
+			__instance.alarmEnabled = currentSleepSetTime != -1;
+			Traverse t = Traverse.Create(__instance);
+			t.Field("currentSleepSetTime").SetValue(currentSleepSetTime);
+
+			PlayerStatsTiredness tiredness = PlayerStats.instance.tiredness;
+			if (tiredness.currentStatus <= 0f)
+			{
+				// Synchronous clamp before StartSleep so the very first tick
+				// cannot wake the player up.
+				tiredness.currentStatus = 1f;
+			}
+
+			MethodInfo startSleep = AccessTools.DeclaredMethod(typeof(WaitingController), "StartSleep", new Type[] { typeof(float), typeof(bool), typeof(SleepEvent[]), typeof(bool), typeof(float) });
+			if (startSleep == null)
+			{
+				TimeTravelPlugin.ModLogger.LogError("Time Travel: could not find WaitingController.StartSleep.");
+				return true;
+			}
+
+			// ShowTimeSetUI already wrote quality / canBeArrested / sleepingEvents /
+			// usePassoutEvents / crimeArrest; reuse them so the skip behaves exactly
+			// like a vanilla alarm-clock sleep.
+			float quality = t.Field("quality").GetValue<float>();
+			bool canBeArrested = t.Field("canBeArrested").GetValue<bool>();
+			SleepEvent[] sleepingEvents = t.Field("sleepingEvents").GetValue<SleepEvent[]>();
+			bool usePassoutEvents = t.Field("usePassoutEvents").GetValue<bool>();
+			float crimeArrest = t.Field("crimeArrest").GetValue<float>();
+			startSleep.Invoke(__instance, new object[] { quality, canBeArrested, sleepingEvents, usePassoutEvents, crimeArrest });
+
+			TimeTravelPlugin.TravelActive = true;
+			TimeTravelPlugin.travelStartTime = Time.unscaledTime;
+			TimeTravelPlugin.ModLogger.LogInfo("Time Travel: sleeping " + currentSleepSetTime + " second(s) (tiredness bypassed).");
+			return false;
 		}
 	}
 }

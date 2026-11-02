@@ -1,10 +1,10 @@
 # Obenseuer-TimeTravel
 
-BepInEx 6 mod for **Obenseuer** that lets you skip forward in game time (1 / 4 / 8 / 12 / 24 hours, configurable) **exactly like sleeping**, reusing the vanilla sleep, pass-out and danger mechanics.
+BepInEx 6 mod for **Obenseuer** that lets you skip forward in game time **exactly like an alarm clock**, reusing the vanilla sleep, pass-out and danger mechanics.
 
 ## Features
 
-- Cycle through configurable skip durations with one key, start the skip with another key.
+- Press **F10** to open the vanilla sleep-time selection UI (the same one the alarm clock item uses) and choose exactly how many hours to sleep with the hour slider.
 - Fully reuses the vanilla sleep pipeline: `WaitingController` (`Type.Sleeping`), `TimeOfDayAzure` time acceleration, mental health drain, **sleep events** (`SleepEventController.CalculateEvent`), and the **arrest check** (`Crime.CheckCrimesForArrest`).
 - By default the tiredness requirement is bypassed so you can skip time anywhere; flip `RequireTiredness` to keep the vanilla "too tired / not tired enough" restriction.
 
@@ -14,10 +14,10 @@ Vanilla sleep: `Sleep.Use()` → `WaitingController.ShowTimeSetUI(...)` (configu
 
 This mod:
 
-1. Press **F9** to cycle the selected duration through `TravelHours` (default `1,4,8,12,24`).
-2. Press **F10** to start the skip. The mod writes the same private fields that `ShowTimeSetUI` would set (`quality=0`, `canBeArrested=<cfg>`, `sleepingEvents=null`, `usePassoutEvents=false`, `crimeArrest=0.1`, `hasAlarmClock=false`) and then either:
-   - calls `WaitingController.Sleep(hours * 3600)` when `RequireTiredness=true` (keeps the tiredness gate), or
-   - invokes the private `WaitingController.StartSleep(...)` directly when `RequireTiredness=false` (bypasses the tiredness gate, keeps all events/danger checks).
+1. Press **F10**. The mod calls `WaitingController.ShowTimeSetUI(0f, canBeArrested, null, false, 0.1f, null, hasAlarmClock: true)`, so `WaitingUI.SetTimeOpen` shows the hour slider (`setAlarm`) exactly like an alarm clock.
+2. Pick the hours in the vanilla UI and confirm. The player's choice flows through the vanilla `WaitingUI.StartSleep` → `WaitingController.Sleep(currentSleepSetTime)`.
+3. With `RequireTiredness=false`, a Harmony `Prefix` on `Sleep(int)` (`SleepBypassPatch`) mirrors the vanilla setup but invokes the private `StartSleep(...)` directly, bypassing the tiredness gate while keeping all events/danger checks. The existing wake-up interception (`TirednessNaturalWakePatch` + `WakeupInterceptPatch`) keeps the session running for the full selected duration.
+4. With `RequireTiredness=true`, the tiredness check runs first and the vanilla `Sleep` path is used unchanged.
 
 ## Installation
 
@@ -29,9 +29,7 @@ This mod:
 
 | Config | Section | Default | Description |
 | --- | --- | --- | --- |
-| `SelectHoursKey` | General | `F9` | Cycle through the skip durations. |
-| `StartTravelKey` | General | `F10` | Start skipping the selected hours. |
-| `TravelHours` | General | `1,4,8,12,24` | Comma separated list of hours to choose from. |
+| `StartTravelKey` | General | `F10` | Open the vanilla sleep-time selection UI (like the alarm clock). |
 | `CanBeArrested` | General | `true` | Allow the vanilla arrest check during the skip. |
 | `RequireTiredness` | General | `false` | If true, only skip time when the player is tired enough to sleep. |
 
